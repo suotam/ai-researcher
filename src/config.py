@@ -27,12 +27,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "timeout_seconds": 1800,
         "max_retries": 1,
         "temperature": 0.4,
-        "max_tokens": 5000,
+        "max_tokens": 6144,
+        "reasoning_effort": "low",
     },
     "collection": {
         "http_timeout_seconds": 20,
         "max_items_per_source": 40,
         "lookback_hours": 24,
+        "fetch_fulltext": True,
+        "fulltext_max_chars": 4000,
     },
     "dedup": {
         "fuzzy_title_threshold": 88,
@@ -42,11 +45,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "top_items": 10,
         "min_score": 25,
         "max_per_category": 8,
+        "llm_rerank": True,
+        "rerank_pool": 30,
     },
     "briefing": {
         "output_dir": "output",
         "language": "cs",
         "learning_topic_cooldown_days": 14,
+        "calendar_horizon_days": 7,
+        "weekly_top_items": 15,
     },
     "logging": {
         "level": "INFO",
@@ -58,12 +65,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 @dataclass
 class Source:
     name: str
-    type: str          # rss | github | arxiv
+    type: str          # rss | github | arxiv | html
     category: str      # ai | markets
     url: str
     enabled: bool = True
     priority: int = 5
     id: int | None = None  # DB id, filled in after sync
+    extra: dict = field(default_factory=dict)  # collector-specific options
+                                               # (e.g. item_selector for html)
 
 
 @dataclass
@@ -71,6 +80,7 @@ class Config:
     settings: dict[str, Any]
     sources: list[Source]
     topics: dict[str, Any]
+    calendar: list[dict[str, Any]] = field(default_factory=list)
     root: Path = field(default_factory=lambda: PROJECT_ROOT)
 
     def setting(self, *keys: str, default: Any = None) -> Any:
@@ -107,6 +117,7 @@ def load_sources(path: Path | None = None) -> list[Source]:
         if not isinstance(entry, dict):
             continue
         try:
+            known = {"name", "type", "category", "url", "enabled", "priority"}
             sources.append(
                 Source(
                     name=str(entry["name"]),
@@ -115,6 +126,7 @@ def load_sources(path: Path | None = None) -> list[Source]:
                     url=str(entry.get("url") or ""),
                     enabled=bool(entry.get("enabled", True)),
                     priority=int(entry.get("priority", 5)),
+                    extra={k: v for k, v in entry.items() if k not in known},
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -123,9 +135,26 @@ def load_sources(path: Path | None = None) -> list[Source]:
     return sources
 
 
+def load_calendar(path: Path | None = None) -> list[dict[str, Any]]:
+    """Manually maintained event calendar (config/calendar.yaml)."""
+    raw = _load_yaml(path or CONFIG_DIR / "calendar.yaml")
+    events = []
+    for entry in raw.get("events", []):
+        if not isinstance(entry, dict) or not entry.get("date") or not entry.get("title"):
+            continue
+        events.append({
+            "date": str(entry["date"]),
+            "title": str(entry["title"]),
+            "category": str(entry.get("category", "")),
+            "note": str(entry.get("note", "")),
+        })
+    return events
+
+
 def load_config(config_dir: Path | None = None) -> Config:
     cdir = config_dir or CONFIG_DIR
     settings = _merge_defaults(DEFAULT_SETTINGS, _load_yaml(cdir / "settings.yaml"))
     sources = load_sources(cdir / "sources.yaml")
     topics = _load_yaml(cdir / "topics.yaml")
-    return Config(settings=settings, sources=sources, topics=topics)
+    calendar = load_calendar(cdir / "calendar.yaml")
+    return Config(settings=settings, sources=sources, topics=topics, calendar=calendar)

@@ -17,7 +17,7 @@ $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $Python      = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 $LlamaExe    = 'C:\llama-cuda\bin\llama-server.exe'
-$LlamaArgs   = '-hf meta-models/Muse-Glimmer-30B-GGUF:Q4_K_M --jinja -c 8192 --host 127.0.0.1 --port 8080'
+$LlamaArgs   = '-hf meta-models/Muse-Glimmer-30B-GGUF:Q4_K_M --jinja -c 16384 --host 127.0.0.1 --port 8080'
 $HealthUrl   = 'http://127.0.0.1:8080/health'
 $Today       = Get-Date -Format 'yyyy-MM-dd'
 $BriefPath   = Join-Path $ProjectRoot "output\$Today-morning-brief.md"
@@ -121,6 +121,20 @@ $proc = Start-Process -FilePath $Python -ArgumentList '-m', 'src.main' `
     -WorkingDirectory $ProjectRoot -WindowStyle Hidden -Wait -PassThru `
     -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 Write-Log "Researcher finished with exit code $($proc.ExitCode)."
+
+# On Sundays also produce the weekly digest (skip if it already exists)
+if ((Get-Date).DayOfWeek -eq 'Sunday') {
+    $WeeklyPath = Join-Path $ProjectRoot "output\$Today-weekly-digest.md"
+    if (-not (Test-Path $WeeklyPath)) {
+        Write-Log 'Sunday - running weekly digest...'
+        $wOut = Join-Path $ProjectRoot 'logs\scheduler-weekly.out.log'
+        $wErr = Join-Path $ProjectRoot 'logs\scheduler-weekly.err.log'
+        $wProc = Start-Process -FilePath $Python -ArgumentList '-m', 'src.main', '--weekly' `
+            -WorkingDirectory $ProjectRoot -WindowStyle Hidden -Wait -PassThru `
+            -RedirectStandardOutput $wOut -RedirectStandardError $wErr
+        Write-Log "Weekly digest finished with exit code $($wProc.ExitCode)."
+    }
+}
 
 # Stop the server only if we started it (default; use -KeepServer to keep it)
 if ($serverProc -and -not $KeepServer) {

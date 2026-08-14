@@ -18,6 +18,25 @@ def briefing_path(output_dir: str | Path, day: date) -> Path:
     return Path(output_dir) / f"{day.isoformat()}-morning-brief.md"
 
 
+def weekly_path(output_dir: str | Path, day: date) -> Path:
+    return Path(output_dir) / f"{day.isoformat()}-weekly-digest.md"
+
+
+def health_section(unhealthy: list[dict]) -> str:
+    """Warn about sources that failed repeatedly — a dead feed is otherwise
+    invisible for weeks."""
+    if not unhealthy:
+        return ""
+    lines = ["", "---", "", "## Zdroje s problémy", ""]
+    for s in unhealthy:
+        lines.append(
+            f"- **{s['name']}** — {s['consecutive_bad']}× po sobě bez dat "
+            f"(poslední stav: {s['last_result']}). Zkontroluj URL/selektor "
+            "v config/sources.yaml."
+        )
+    return "\n".join(lines)
+
+
 def extract_learning_topic(text: str) -> str | None:
     match = _LEARNING_TOPIC_RE.search(text or "")
     return match.group(1).strip() if match else None
@@ -35,7 +54,9 @@ def _sources_section(articles: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def render_brief(llm_output: str, articles: list[dict[str, Any]], day: date) -> str:
+def render_brief(llm_output: str, articles: list[dict[str, Any]], day: date,
+                 unhealthy_sources: list[dict] | None = None,
+                 title: str = "Morning Brief") -> str:
     """Turn the LLM output into the final Markdown file content.
 
     Inline [ARTICLE_12] references become linked [[12]](url) markers and a
@@ -55,14 +76,17 @@ def render_brief(llm_output: str, articles: list[dict[str, Any]], day: date) -> 
     # Drop the machine-readable learning-topic marker from the human report.
     body = _LEARNING_TOPIC_RE.sub(lambda m: f"**Téma: {m.group(1).strip()}**", body)
 
-    header = f"# Morning Brief — {day.isoformat()}\n\n"
+    header = f"# {title} — {day.isoformat()}\n\n"
     if body.lstrip().startswith("# "):
         header = ""  # model already produced a top-level heading
-    return header + body.strip() + _sources_section(articles) + "\n"
+    return (header + body.strip() + _sources_section(articles)
+            + health_section(unhealthy_sources or []) + "\n")
 
 
 def render_fallback_brief(articles: list[dict[str, Any]], day: date,
-                          reason: str = "LLM disabled") -> str:
+                          reason: str = "LLM disabled",
+                          calendar_events: list[dict] | None = None,
+                          unhealthy_sources: list[dict] | None = None) -> str:
     """Brief without LLM synthesis (--no-llm or Glimmer unreachable).
 
     Groups the top-ranked items by category so the run still produces a
@@ -95,8 +119,20 @@ def render_fallback_brief(articles: list[dict[str, Any]], day: date,
             summary = (a.get("summary") or "").strip()
             if summary:
                 lines.append(f"- Summary: {summary[:400]}")
+            if a.get("duplicate_count"):
+                lines.append(f"- Coverage: {a['duplicate_count'] + 1} outlets")
             lines.append("")
-    return "\n".join(lines) + _sources_section(articles) + "\n"
+
+    if calendar_events:
+        lines.append("## Watchlist (kalendář)")
+        lines.append("")
+        for e in calendar_events:
+            note = f" — {e['note']}" if e.get("note") else ""
+            lines.append(f"- {e['date']}: {e['title']}{note}")
+        lines.append("")
+
+    return ("\n".join(lines) + _sources_section(articles)
+            + health_section(unhealthy_sources or []) + "\n")
 
 
 def write_brief(content: str, path: Path) -> Path:

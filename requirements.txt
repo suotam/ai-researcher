@@ -4,3 +4,5 @@ PyYAML>=6.0
 rapidfuzz>=3.6
 python-dateutil>=2.9
 pytest>=8.0
+trafilatura>=1.8
+beautifulsoup4>=4.12

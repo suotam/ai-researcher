@@ -20,11 +20,12 @@ class LLMError(Exception):
 class LLMClient:
     def __init__(self, *, base_url: str = "http://127.0.0.1:8080",
                  model: str = "Muse-Glimmer-30B", timeout_seconds: float = 600,
-                 max_retries: int = 2):
+                 max_retries: int = 2, reasoning_effort: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout_seconds
         self.max_retries = max_retries
+        self.reasoning_effort = reasoning_effort
 
     def is_alive(self) -> bool:
         """Check whether the llama.cpp server is up (GET /health)."""
@@ -37,6 +38,19 @@ class LLMClient:
                 continue
         return False
 
+    def context_size(self) -> int | None:
+        """Ask llama.cpp for its context window (GET /props). None if unknown."""
+        try:
+            resp = httpx.get(f"{self.base_url}/props", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                n_ctx = (data.get("default_generation_settings") or {}).get("n_ctx") \
+                    or data.get("n_ctx")
+                return int(n_ctx) if n_ctx else None
+        except (httpx.HTTPError, ValueError, TypeError):
+            pass
+        return None
+
     def chat(self, messages: list[dict], *, temperature: float = 0.4,
              max_tokens: int = 3000) -> str:
         """POST /v1/chat/completions with retries. Raises LLMError on failure."""
@@ -47,6 +61,11 @@ class LLMClient:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if self.reasoning_effort:
+            # Reasoning models burn output tokens on thinking before they
+            # answer. llama.cpp forwards this for templates that support it
+            # and ignores it otherwise, so sending it is always safe.
+            payload["reasoning_effort"] = self.reasoning_effort
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 2):
             try:

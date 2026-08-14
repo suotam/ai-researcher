@@ -51,14 +51,41 @@ def _article_block(ref_id: str, article: dict[str, Any], max_text_chars: int = 6
     )
 
 
+def _coverage_line(article: dict[str, Any]) -> str:
+    count = article.get("duplicate_count") or 0
+    if not count:
+        return ""
+    outlets = article.get("coverage_sources") or []
+    detail = f" ({', '.join(outlets[:5])})" if outlets else ""
+    return f"Coverage: reported by {count + 1} outlets{detail}\n"
+
+
+def _calendar_block(events: list[dict[str, Any]]) -> str:
+    if not events:
+        return ""
+    lines = ["", "=== KALENDÁŘ (ručně udržovaný, ověřené nadcházející události) ===", ""]
+    for e in events:
+        note = f" — {e['note']}" if e.get("note") else ""
+        lines.append(f"- {e['date']}: {e['title']} [{e.get('category', '')}]{note}")
+    lines.append("")
+    lines.append("Tyto události zařaď do sekce Watchlist (jsou ověřené, "
+                 "smíš je použít bez [ARTICLE_x] reference).")
+    return "\n".join(lines)
+
+
 def build_briefing_prompt(articles: list[dict[str, Any]], *, date_str: str,
                           recent_learning_topics: list[str],
-                          language: str = "cs") -> tuple[str, str]:
+                          language: str = "cs",
+                          calendar_events: list[dict[str, Any]] | None = None,
+                          max_text_chars: int = 600) -> tuple[str, str]:
     """Return (system_prompt, user_prompt). Each article dict must contain a
     'ref_id' key like 'ARTICLE_12' (its DB id)."""
     system = SYSTEM_PROMPT_CS if language == "cs" else SYSTEM_PROMPT_EN
 
-    blocks = "\n".join(_article_block(a["ref_id"], a) for a in articles)
+    blocks = "\n".join(
+        _article_block(a["ref_id"], a, max_text_chars) + _coverage_line(a)
+        for a in articles
+    )
     avoid = ", ".join(recent_learning_topics) if recent_learning_topics else "(zatím žádná)"
 
     user = f"""Datum: {date_str}
@@ -92,10 +119,47 @@ Na první řádek sekce napiš přesně: LEARNING_TOPIC: <název tématu>
 
 ## Watchlist
 Několik věcí ke sledování v dalších hodinách/dnech — POUZE odvozené
-z dodaných zdrojů, žádné vymyšlené budoucí eventy.
+z dodaných zdrojů nebo z kalendáře níže, žádné vymyšlené budoucí eventy.
 
 Důležité: každé tvrzení odkazuj na zdrojové položky pomocí [ARTICLE_x].
 Pokud v některé kategorii není nic významného, napiš to.
+U položek s "Coverage" údajem: široké pokrytí více médii signalizuje
+významnost události.
+
+=== POLOŽKY ===
+
+{blocks}{_calendar_block(calendar_events or [])}"""
+    return system, user
+
+
+def build_weekly_prompt(articles: list[dict[str, Any]], *, date_str: str,
+                        language: str = "cs",
+                        max_text_chars: int = 400) -> tuple[str, str]:
+    """Weekly digest: trends and through-lines rather than day-by-day news."""
+    system = SYSTEM_PROMPT_CS if language == "cs" else SYSTEM_PROMPT_EN
+    blocks = "\n".join(
+        _article_block(a["ref_id"], a, max_text_chars) + _coverage_line(a)
+        for a in articles
+    )
+    user = f"""Datum: {date_str}
+
+Níže jsou nejvýznamnější položky z POSLEDNÍCH 7 DNÍ (AI + finanční trhy).
+Vytvoř týdenní přehled v Markdownu — ne výčet zpráv den po dni, ale analýzu
+trendů a souvislostí napříč týdnem:
+
+## Týden v kostce
+3-5 vět: co byl hlavní příběh týdne.
+
+## Trendy a souvislosti
+2-4 podsekce. Každá spojuje více událostí týdne do jednoho vývoje/tématu
+(např. "capex hyperscalerů dál roste", "trh přeceňuje sazby"). U každé:
+**Co se dělo** ... **Kam to směřuje** ... **Zdroje** [ARTICLE_x], [ARTICLE_y]
+
+## Co příští týden
+Jen věci doložené ve zdrojích.
+
+Každé tvrzení odkazuj pomocí [ARTICLE_x]. Pokud byl týden chudý na události,
+řekni to.
 
 === POLOŽKY ===
 

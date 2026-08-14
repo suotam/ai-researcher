@@ -100,16 +100,26 @@ def title_indicator_points(title: str) -> int:
     return points
 
 
+def coverage_points(duplicate_count: int) -> int:
+    """Breadth of coverage: each extra outlet writing about the same event
+    adds points, capped so one viral story cannot dominate on this alone."""
+    return min(max(duplicate_count, 0) * 4, 12)
+
+
 def score_article(*, title: str, summary: str, category: str,
                   source_priority: int, source_type: str,
                   published_at: Any, topics: dict[str, Any],
-                  now: datetime | None = None) -> int:
+                  now: datetime | None = None,
+                  duplicate_count: int = 0,
+                  feedback_adjust: int = 0) -> int:
     topic_cfg = topics.get(category) or {}
     score = 0.0
     score += min(max(source_priority, 0), 10) * 2.5
     score += recency_points(published_at, now)
     score += keyword_points(f"{title} {summary}", topic_cfg)
     score += title_indicator_points(title)
+    score += coverage_points(duplicate_count)
+    score += feedback_adjust
     if source_type == "arxiv":
         score -= ARXIV_PENALTY
     importance = topic_cfg.get("importance", 1.0)

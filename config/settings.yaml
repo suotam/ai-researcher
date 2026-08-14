@@ -6,13 +6,17 @@ llm:
   timeout_seconds: 1800             # Glimmer 30B @ ~3 tok/s + reasoning tokens needs headroom
   max_retries: 1
   temperature: 0.4
-  max_tokens: 5000                  # reasoning models spend part of this budget on thinking;
+  max_tokens: 6144                  # reasoning models spend part of this budget on thinking;
                                     # prompt + max_tokens must fit into the server's -c context
+  reasoning_effort: low             # forwarded to llama.cpp; lowers thinking-token burn
+                                    # on templates that support it, ignored otherwise
 
 collection:
   http_timeout_seconds: 20
   max_items_per_source: 40          # hard cap per feed per run
-  lookback_hours: 24                # default window for --hours
+  lookback_hours: 24
+  fetch_fulltext: true              # fetch article pages for the final selection
+  fulltext_max_chars: 4000                # default window for --hours
 
 dedup:
   fuzzy_title_threshold: 88         # rapidfuzz token_sort_ratio, 0-100
@@ -22,11 +26,15 @@ ranking:
   top_items: 10                     # how many articles are sent to the LLM
   min_score: 25                     # articles below this never reach the brief
   max_per_category: 8               # avoid one category flooding the brief
+  llm_rerank: true                  # second-layer ranking via one cheap LLM call
+  rerank_pool: 30                   # how many candidates the rerank call sees
 
 briefing:
   output_dir: output
   language: cs                      # language of the generated brief (cs / en)
   learning_topic_cooldown_days: 14  # don't reuse a learning topic within N days
+  calendar_horizon_days: 7          # config/calendar.yaml events within N days go to Watchlist
+  weekly_top_items: 15              # articles fed into the --weekly digest
 
 logging:
   level: INFO

@@ -8,8 +8,13 @@
 $TaskName   = 'AI Researcher Morning Brief'
 $ScriptPath = Join-Path $PSScriptRoot 'run_morning_brief.ps1'
 
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
+# Full path — Task Scheduler may fail with 0x80070002 (file not found) when
+# the action uses a bare 'powershell.exe'.
+$PowerShellExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+$action = New-ScheduledTaskAction -Execute $PowerShellExe `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`"" `
+    -WorkingDirectory (Split-Path -Parent $PSScriptRoot)
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $trigger.Delay = 'PT2M'   # give the desktop 2 minutes to settle after login

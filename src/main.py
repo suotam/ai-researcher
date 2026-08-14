@@ -1,12 +1,14 @@
 """AI Researcher — CLI entry point.
 
 Pipeline:
-    SOURCES -> COLLECT -> NORMALIZE -> DEDUPLICATE -> STORE (SQLite)
-            -> RANK -> SELECT TOP -> GLIMMER SYNTHESIS -> MORNING BRIEF
+    SOURCES -> COLLECT -> NORMALIZE -> DEDUPLICATE (+coverage) -> STORE (SQLite)
+            -> RANK -> LLM RERANK -> SELECT TOP -> FULLTEXT -> GLIMMER SYNTHESIS
+            -> MORNING BRIEF
 
 Run:
     python -m src.main             # full run (needs local llama.cpp server)
     python -m src.main --no-llm    # skip synthesis, produce fallback brief
+    python -m src.main --weekly    # weekly digest from the last 7 days
 """
 
 from __future__ import annotations
@@ -18,14 +20,16 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from . import db
-from .collectors import arxiv, github, rss
+from .collectors import arxiv, github, html, rss
 from .config import DB_PATH, PROJECT_ROOT, Config, Source, load_config
 from .llm.client import LLMClient, LLMError
-from .llm.prompts import build_briefing_prompt
+from .llm.prompts import build_briefing_prompt, build_weekly_prompt
 from .models import RawItem
 from .processing.deduplicate import Deduplicator
+from .processing.fulltext import enrich_articles
 from .processing.normalize import canonicalize_url, clean_text, content_hash
 from .processing.ranking import score_article, select_top
+from .processing.rerank import llm_rerank
 from .reporting import briefing
 
 log = logging.getLogger("researcher")
@@ -34,7 +38,10 @@ COLLECTORS = {
     "rss": rss.collect,
     "github": github.collect,
     "arxiv": arxiv.collect,
+    "html": html.collect,
 }
+
+HEALTH_THRESHOLD = 3  # consecutive bad fetches before a source is flagged
 
 
 def setup_logging(cfg: Config) -> None:
@@ -71,10 +78,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="collect and score but write nothing (no DB rows, no brief)")
     parser.add_argument("--top", type=int, default=None,
                         help="override number of items sent to the LLM")
+    parser.add_argument("--weekly", action="store_true",
+                        help="generate a weekly digest from the last 7 days "
+                             "(no collection, uses stored articles)")
     return parser.parse_args(argv)
 
 
-def collect_all(sources: list[Source], *, timeout: float, max_items: int,
+# ------------------------------------------------------------------ pipeline
+
+def collect_all(conn, sources: list[Source], *, timeout: float, max_items: int,
                 categories: list[str] | None) -> list[RawItem]:
     items: list[RawItem] = []
     active = [s for s in sources
@@ -88,23 +100,36 @@ def collect_all(sources: list[Source], *, timeout: float, max_items: int,
             continue
         try:
             fetched = collector(source, timeout=timeout, max_items=max_items)
+            result = "ok" if fetched else "empty"
         except Exception:  # a single broken source must never kill the run
             log.exception("Collector for '%s' failed unexpectedly", source.name)
-            fetched = []
+            fetched, result = [], "error"
+        if source.id is not None:
+            bad = db.update_source_health(conn, source.id, result)
+            if bad >= HEALTH_THRESHOLD:
+                log.warning("Source '%s' has failed %d consecutive runs",
+                            source.name, bad)
         log.info("  %-28s %3d items", source.name, len(fetched))
         items.extend(fetched)
+    conn.commit()
     return items
 
 
 def store_new_items(conn, items: list[RawItem], cfg: Config,
-                    source_ids: dict[str, int | None], *, dry_run: bool) -> tuple[list[int], int]:
-    """Dedup + insert. Returns (new article ids, duplicate count)."""
+                    source_ids: dict[str, int | None], *,
+                    dry_run: bool) -> tuple[list[int], set[int], int]:
+    """Dedup + insert.
+
+    Returns (new article ids, ids of originals whose coverage grew,
+    duplicate count).
+    """
     dedup = Deduplicator(
         conn,
         fuzzy_threshold=int(cfg.setting("dedup", "fuzzy_title_threshold", default=88)),
         window_days=int(cfg.setting("dedup", "fuzzy_window_days", default=7)),
     )
     new_ids: list[int] = []
+    touched_originals: set[int] = set()
     duplicates = 0
     now_iso = db.utcnow_iso()
     for item in items:
@@ -112,13 +137,25 @@ def store_new_items(conn, items: list[RawItem], cfg: Config,
         title = clean_text(item.title, 500)
         if not url or not title:
             continue
-        reason = dedup.check(title=title, url=url)
-        if reason:
+        match = dedup.check(title=title, url=url)
+        if match:
             duplicates += 1
-            log.debug("Duplicate (%s): %s", reason, title[:80])
+            # Coverage tracking: same event from a *different* source is an
+            # importance signal for the original article.
+            if match.article_id is not None and not dry_run:
+                original = conn.execute(
+                    "SELECT s.name AS src FROM articles a "
+                    "LEFT JOIN sources s ON s.id = a.source_id WHERE a.id = ?",
+                    (match.article_id,)).fetchone()
+                if original and original["src"] != item.source_name:
+                    db.record_duplicate(
+                        conn, article_id=match.article_id,
+                        source_name=item.source_name, title=title, url=url)
+                    touched_originals.add(match.article_id)
+            log.debug("Duplicate (%s): %s", match.reason, title[:80])
             continue
-        dedup.register(title)
         if dry_run:
+            dedup.register(title)
             continue
         article_id = db.insert_article(
             conn,
@@ -135,15 +172,17 @@ def store_new_items(conn, items: list[RawItem], cfg: Config,
             category=item.category,
             content_hash=content_hash(title),
         )
+        dedup.register(title, article_id)
         new_ids.append(article_id)
     if not dry_run:
         conn.commit()
-    return new_ids, duplicates
+    return new_ids, touched_originals, duplicates
 
 
-def rank_new_articles(conn, cfg: Config, article_ids: list[int],
-                      sources_by_id: dict[int | None, Source]) -> None:
+def rank_articles(conn, cfg: Config, article_ids: list[int],
+                  sources_by_id: dict[int | None, Source]) -> None:
     now = datetime.now(timezone.utc)
+    feedback_adjust = db.source_feedback_adjustments(conn)
     for article_id in article_ids:
         row = conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
         if row is None:
@@ -158,53 +197,170 @@ def rank_new_articles(conn, cfg: Config, article_ids: list[int],
             published_at=row["published_at"],
             topics=cfg.topics,
             now=now,
+            duplicate_count=row["duplicate_count"],
+            feedback_adjust=feedback_adjust.get(row["source_id"], 0),
         )
         db.update_score(conn, article_id, score)
     conn.commit()
 
 
-def synthesize(cfg: Config, selected: list[dict], day: date,
-               recent_topics: list[str]) -> tuple[str, str | None]:
-    """Run Glimmer synthesis. Returns (markdown_body, learning_topic).
-
-    Falls back to the raw-selection brief if the server is down or errors out.
-    """
-    client = LLMClient(
+def make_llm_client(cfg: Config) -> LLMClient:
+    return LLMClient(
         base_url=str(cfg.setting("llm", "base_url", default="http://127.0.0.1:8080")),
         model=str(cfg.setting("llm", "model", default="Muse-Glimmer-30B")),
-        timeout_seconds=float(cfg.setting("llm", "timeout_seconds", default=600)),
-        max_retries=int(cfg.setting("llm", "max_retries", default=2)),
+        timeout_seconds=float(cfg.setting("llm", "timeout_seconds", default=1800)),
+        max_retries=int(cfg.setting("llm", "max_retries", default=1)),
+        reasoning_effort=cfg.setting("llm", "reasoning_effort", default="low") or None,
     )
-    if not client.is_alive():
-        log.error("LLM server at %s is not reachable — writing fallback brief. "
-                  "Start llama-server and re-run for a full synthesis.", client.base_url)
-        return briefing.render_fallback_brief(selected, day, "server nedostupný"), None
 
-    system, user = build_briefing_prompt(
-        selected,
-        date_str=day.isoformat(),
-        recent_learning_topics=recent_topics,
-        language=str(cfg.setting("briefing", "language", default="cs")),
-    )
+
+def upcoming_calendar_events(cfg: Config, today: date) -> list[dict]:
+    horizon = int(cfg.setting("briefing", "calendar_horizon_days", default=7))
+    end = today + timedelta(days=horizon)
+    upcoming = []
+    for event in cfg.calendar:
+        try:
+            event_day = date.fromisoformat(event["date"])
+        except ValueError:
+            continue
+        if today <= event_day <= end:
+            upcoming.append(event)
+    return sorted(upcoming, key=lambda e: e["date"])
+
+
+CHARS_PER_TOKEN = 3.5  # rough estimate for prompt budgeting
+
+# A reasoning model burns a large part of its completion budget on thinking
+# before it writes the brief. Below this floor it tends to produce nothing,
+# so shorter article texts are always the better trade.
+MIN_COMPLETION_TOKENS = 4000
+
+
+def _fit_prompt(cfg: Config, client: LLMClient, selected: list[dict], day: date,
+                recent_topics: list[str],
+                calendar_events: list[dict]) -> tuple[str, str, int]:
+    """Build the briefing prompt sized to the server's actual context window.
+
+    Starts with generous article texts and shrinks them until prompt +
+    a completion of at least MIN_COMPLETION_TOKENS fits into n_ctx (with
+    ~5% margin). Returns (system, user, max_tokens)."""
+    max_tokens = int(cfg.setting("llm", "max_tokens", default=5000))
+    n_ctx = client.context_size()
+    language = str(cfg.setting("briefing", "language", default="cs"))
+
+    budget = max_tokens
+    for max_text_chars in (1500, 900, 600, 400):
+        system, user = build_briefing_prompt(
+            selected, date_str=day.isoformat(),
+            recent_learning_topics=recent_topics, language=language,
+            calendar_events=calendar_events, max_text_chars=max_text_chars,
+        )
+        if n_ctx is None:
+            return system, user, max_tokens
+        prompt_tokens = int(len(system + user) / CHARS_PER_TOKEN)
+        budget = int(n_ctx * 0.95) - prompt_tokens
+        if budget >= min(max_tokens, MIN_COMPLETION_TOKENS):
+            if budget < max_tokens:
+                log.info("Context %d is tight: capping completion to %d tokens "
+                         "(article texts at %d chars). Restart llama-server "
+                         "with a larger -c for fuller briefs.",
+                         n_ctx, budget, max_text_chars)
+            return system, user, min(max_tokens, budget)
+    log.warning("Prompt barely fits context %s even with short texts — "
+                "the model may not finish the brief", n_ctx)
+    return system, user, max(budget, 1500)
+
+
+def synthesize(cfg: Config, client: LLMClient, selected: list[dict], day: date,
+               recent_topics: list[str], calendar_events: list[dict],
+               unhealthy: list[dict]) -> tuple[str, str | None]:
+    """Run Glimmer synthesis. Returns (markdown_body, learning_topic)."""
+    system, user, max_tokens = _fit_prompt(
+        cfg, client, selected, day, recent_topics, calendar_events)
     try:
         output = client.chat(
             [{"role": "system", "content": system},
              {"role": "user", "content": user}],
             temperature=float(cfg.setting("llm", "temperature", default=0.4)),
-            max_tokens=int(cfg.setting("llm", "max_tokens", default=3000)),
+            max_tokens=max_tokens,
         )
     except LLMError as exc:
         log.error("LLM synthesis failed: %s — writing fallback brief.", exc)
-        return briefing.render_fallback_brief(selected, day, "chyba LLM"), None
+        return briefing.render_fallback_brief(
+            selected, day, "chyba LLM", calendar_events, unhealthy), None
 
     topic = briefing.extract_learning_topic(output)
-    return briefing.render_brief(output, selected, day), topic
+    return briefing.render_brief(output, selected, day, unhealthy), topic
 
+
+# ------------------------------------------------------------------ weekly
+
+def run_weekly(cfg: Config, args: argparse.Namespace) -> int:
+    """Weekly digest from stored articles — no collection, one LLM call."""
+    conn = db.connect(DB_PATH)
+    today = date.today()
+    period_start = datetime.now(timezone.utc) - timedelta(days=7)
+    limit = args.top or int(cfg.setting("briefing", "weekly_top_items", default=15))
+    rows = [dict(r) for r in db.top_articles_for_period(
+        conn, since_iso=period_start.isoformat(timespec="seconds"), limit=limit)]
+    for article in rows:
+        article["ref_id"] = f"ARTICLE_{article['id']}"
+        article["coverage_sources"] = db.coverage_sources(conn, article["id"])
+    log.info("Weekly digest: %d articles from the last 7 days", len(rows))
+
+    out_dir = PROJECT_ROOT / cfg.setting("briefing", "output_dir", default="output")
+    path = briefing.weekly_path(out_dir, today)
+
+    if args.no_llm or not rows:
+        content = briefing.render_fallback_brief(
+            rows, today, "--no-llm" if args.no_llm else "žádné položky")
+    else:
+        client = make_llm_client(cfg)
+        if not client.is_alive():
+            log.error("LLM server not reachable — writing fallback weekly digest.")
+            content = briefing.render_fallback_brief(rows, today, "server nedostupný")
+        else:
+            system, user = build_weekly_prompt(
+                rows, date_str=today.isoformat(),
+                language=str(cfg.setting("briefing", "language", default="cs")))
+            try:
+                output = client.chat(
+                    [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+                    temperature=float(cfg.setting("llm", "temperature", default=0.4)),
+                    max_tokens=int(cfg.setting("llm", "max_tokens", default=5000)),
+                )
+                content = briefing.render_brief(output, rows, today,
+                                                title="Weekly Digest")
+            except LLMError as exc:
+                log.error("Weekly synthesis failed: %s", exc)
+                content = briefing.render_fallback_brief(rows, today, "chyba LLM")
+
+    briefing.write_brief(content, path)
+    db.insert_briefing(
+        conn,
+        period_start=period_start.isoformat(timespec="seconds"),
+        period_end=db.utcnow_iso(),
+        file_path=str(path),
+        article_ids=[a["id"] for a in rows],
+    )
+    conn.commit()
+    conn.close()
+    log.info("=== Weekly digest finished: %s ===", path)
+    print(f"\nWeekly digest: {path}")
+    return 0
+
+
+# ------------------------------------------------------------------ daily
 
 def run(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_config()
     setup_logging(cfg)
+
+    if args.weekly:
+        log.info("=== Weekly digest run started ===")
+        return run_weekly(cfg, args)
 
     log.info("=== Researcher run started (dry_run=%s, no_llm=%s) ===",
              args.dry_run, args.no_llm)
@@ -217,66 +373,104 @@ def run(argv: list[str] | None = None) -> int:
     source_ids = {s.name: s.id for s in cfg.sources}
     sources_by_id = {s.id: s for s in cfg.sources}
 
-    # 1) collect
+    # 1) collect (health-tracked)
     items = collect_all(
-        cfg.sources,
+        conn, cfg.sources,
         timeout=float(cfg.setting("collection", "http_timeout_seconds", default=20)),
         max_items=int(cfg.setting("collection", "max_items_per_source", default=40)),
         categories=categories,
     )
     log.info("Collected %d raw items", len(items))
 
-    # 2) dedup + store
-    new_ids, duplicates = store_new_items(conn, items, cfg, source_ids,
-                                          dry_run=args.dry_run)
-    log.info("New items stored: %d, duplicates skipped: %d", len(new_ids), duplicates)
+    # 2) dedup + store (+ coverage tracking)
+    new_ids, touched, duplicates = store_new_items(
+        conn, items, cfg, source_ids, dry_run=args.dry_run)
+    log.info("New items stored: %d, duplicates: %d (coverage grew for %d articles)",
+             len(new_ids), duplicates, len(touched))
 
     if args.dry_run:
         log.info("Dry run - no DB writes, no briefing. Done.")
         conn.close()
         return 0
 
-    # 3) rank
-    rank_new_articles(conn, cfg, new_ids, sources_by_id)
+    # 3) rank new articles + re-rank originals whose coverage grew
+    rank_articles(conn, cfg, list(dict.fromkeys(new_ids + list(touched))),
+                  sources_by_id)
 
-    # 4) select
+    # 4) select candidates
     period_end = datetime.now(timezone.utc)
     period_start = period_end - timedelta(hours=hours)
     candidates = [dict(r) for r in db.candidates_for_briefing(
         conn, since_iso=period_start.isoformat(timespec="seconds"),
         categories=categories,
     )]
-    top_n = args.top or int(cfg.setting("ranking", "top_items", default=12))
-    selected = select_top(
+    top_n = args.top or int(cfg.setting("ranking", "top_items", default=10))
+    preselected = select_top(
         candidates,
-        top_items=top_n,
+        top_items=int(cfg.setting("ranking", "rerank_pool", default=30)),
         min_score=int(cfg.setting("ranking", "min_score", default=25)),
-        max_per_category=int(cfg.setting("ranking", "max_per_category", default=8)),
+        max_per_category=int(cfg.setting("ranking", "rerank_pool", default=30)),
     )
+    log.info("Candidates in window: %d, pre-selected for rerank: %d",
+             len(candidates), len(preselected))
+
+    # 5) LLM rerank (optional, falls back to cheap ranking)
+    client = make_llm_client(cfg)
+    llm_available = not args.no_llm and client.is_alive()
+    if not args.no_llm and not llm_available:
+        log.error("LLM server at %s is not reachable — continuing without it. "
+                  "Start llama-server and re-run for a full synthesis.",
+                  client.base_url)
+
+    selected: list[dict] | None = None
+    if llm_available and cfg.setting("ranking", "llm_rerank", default=True) \
+            and len(preselected) > top_n:
+        selected = llm_rerank(client, preselected, top_n=top_n)
+    if selected is None:
+        selected = select_top(
+            preselected,
+            top_items=top_n,
+            min_score=int(cfg.setting("ranking", "min_score", default=25)),
+            max_per_category=int(cfg.setting("ranking", "max_per_category", default=8)),
+        )
     for article in selected:
         article["ref_id"] = f"ARTICLE_{article['id']}"
-    log.info("Candidates in window: %d, selected for brief: %d",
-             len(candidates), len(selected))
+        article["coverage_sources"] = db.coverage_sources(conn, article["id"])
+    log.info("Selected for brief: %d", len(selected))
 
-    # 5) synthesize + write brief
+    # 6) fulltext enrichment for the final selection
+    if selected and cfg.setting("collection", "fetch_fulltext", default=True):
+        enrich_articles(
+            selected,
+            timeout=float(cfg.setting("collection", "http_timeout_seconds", default=20)),
+            max_chars=int(cfg.setting("collection", "fulltext_max_chars", default=4000)),
+        )
+
+    # 7) synthesize + write brief
     day = date.today()
     out_dir = PROJECT_ROOT / cfg.setting("briefing", "output_dir", default="output")
     path = briefing.briefing_path(out_dir, day)
+    calendar_events = upcoming_calendar_events(cfg, day)
+    unhealthy = [dict(r) for r in db.unhealthy_sources(conn, threshold=HEALTH_THRESHOLD)]
 
     learning_topic: str | None = None
-    if args.no_llm:
-        content = briefing.render_fallback_brief(selected, day, "--no-llm")
+    if not llm_available:
+        reason = "--no-llm" if args.no_llm else "server nedostupný"
+        content = briefing.render_fallback_brief(selected, day, reason,
+                                                 calendar_events, unhealthy)
     elif not selected:
         log.info("Nothing significant found in the window — writing empty brief.")
-        content = briefing.render_fallback_brief(selected, day, "žádné relevantní položky")
+        content = briefing.render_fallback_brief(selected, day, "žádné relevantní položky",
+                                                 calendar_events, unhealthy)
     else:
         recent_topics = db.recent_learning_topics(
             conn, int(cfg.setting("briefing", "learning_topic_cooldown_days", default=14)))
-        content, learning_topic = synthesize(cfg, selected, day, recent_topics)
+        content, learning_topic = synthesize(
+            cfg, client, selected, day, recent_topics, calendar_events, unhealthy)
 
     briefing.write_brief(content, path)
 
-    # 6) record briefing + mark articles
+    # 8) record briefing + mark articles
     selected_ids = [a["id"] for a in selected]
     db.insert_briefing(
         conn,

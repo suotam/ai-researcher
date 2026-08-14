@@ -16,21 +16,23 @@ zdrojů.
 ```text
 SOURCES (config/sources.yaml)
    ↓
-COLLECT      src/collectors/   rss.py | github.py | arxiv.py
-   ↓
+COLLECT      src/collectors/   rss.py | github.py | arxiv.py | html.py
+   ↓          (health tracking: 3× po sobě mrtvý zdroj → varování v briefu)
 NORMALIZE    src/processing/normalize.py   (canonical URL, čištění HTML, hash)
    ↓
 DEDUPLICATE  src/processing/deduplicate.py (exact URL → canonical URL → title hash → fuzzy title)
-   ↓
+   ↓          (duplicity se počítají k originálu: "5 médií píše o tomtéž" = signál důležitosti)
 STORE        src/db.py                     (SQLite: data/researcher.db)
    ↓
-RANK         src/processing/ranking.py     (score 0–100 bez LLM)
+RANK         src/processing/ranking.py     (score 0–100 bez LLM; + coverage boost, + feedback)
    ↓
-SELECT TOP N (konfigurovatelné, default 12)
+LLM RERANK   src/processing/rerank.py      (1 levný LLM call: top 30 → top 10; volitelné)
    ↓
-SYNTHESIS    src/llm/client.py + prompts.py (lokální Glimmer 30B)
+FULLTEXT     src/processing/fulltext.py    (trafilatura stáhne plné texty vybraných článků)
    ↓
-BRIEF        output/YYYY-MM-DD-morning-brief.md
+SYNTHESIS    src/llm/client.py + prompts.py (lokální Glimmer 30B; prompt se adaptuje na n_ctx serveru)
+   ↓
+BRIEF        output/YYYY-MM-DD-morning-brief.md (+ Watchlist z config/calendar.yaml)
 ```
 
 Žádný agent framework, žádný ORM, žádné embeddingy — čistý Python. Dedup je
@@ -56,7 +58,7 @@ pip install -r requirements.txt
 V samostatném okně (cmd):
 
 ```cmd
-C:\llama-cuda\bin\llama-server.exe -hf meta-models/Muse-Glimmer-30B-GGUF:Q4_K_M --jinja -c 8192 --host 127.0.0.1 --port 8080
+C:\llama-cuda\bin\llama-server.exe -hf meta-models/Muse-Glimmer-30B-GGUF:Q4_K_M --jinja -c 16384 --host 127.0.0.1 --port 8080
 ```
 
 Server drž na `127.0.0.1` — nevystavuj ho na `0.0.0.0`.
@@ -64,11 +66,14 @@ Server drž na `127.0.0.1` — nevystavuj ho na `0.0.0.0`.
 ## Spuštění Researchera
 
 ```powershell
-# plný run (sběr + ranking + LLM syntéza)
+# plný run (sběr + ranking + LLM rerank + syntéza)
 python -m src.main
 
 # bez LLM — jen sběr, dedup, ranking a "surový" briefing (na testy)
 python -m src.main --no-llm
+
+# týdenní digest (trendy za posledních 7 dní, bez sběru)
+python -m src.main --weekly
 
 # další volby
 python -m src.main --hours 48            # širší časové okno
@@ -77,6 +82,27 @@ python -m src.main --category markets
 python -m src.main --dry-run             # nic nezapisuje, jen spočítá
 python -m src.main --top 20              # více položek pro LLM
 ```
+
+## Zpětná vazba (učení tvého vkusu)
+
+Články v briefu mají ID — čísla v odkazech `[[123]]`. Ohodnocením učíš
+ranker, co tě zajímá:
+
+```powershell
+python -m src.feedback 123 --up                  # tohle chci vídat
+python -m src.feedback 123 456 --down --note "clickbait"
+python -m src.feedback --stats                   # přehled per zdroj
+```
+
+Zdroje, které konzistentně hodnotíš kladně, dostávají až +10 ke skóre,
+konzistentně záporné až −10.
+
+## Kalendář událostí
+
+`config/calendar.yaml` — ručně udržovaný seznam nadcházejících událostí
+(FOMC, CPI, earnings…). Události v horizontu `briefing.calendar_horizon_days`
+(default 7 dní) se automaticky objeví ve Watchlistu briefu. Data ber
+z oficiálních kalendářů (odkazy v souboru) — nevymýšlet.
 
 ## Automatické spuštění po zapnutí PC
 
@@ -87,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File scripts\register_task.ps1
 ```
 
 Od té chvíle se **2 minuty po každém přihlášení** spustí
-`scripts\run_morning_brief.ps1`, který:
+`scripts\run_morning_brief.ps1` (v neděli navíc vygeneruje týdenní digest), který:
 
 1. přeskočí běh, pokud dnešní brief už existuje (druhé přihlášení v týž den
    jen znovu ukáže notifikaci),
@@ -156,6 +182,21 @@ Do `config/sources.yaml` přidej:
 Bez tokenu má GitHub API limit 60 requestů/hod — pro pár repozitářů to bohatě
 stačí; překročení se jen zaloguje a run pokračuje.
 
+### Přidání HTML zdroje (weby bez RSS)
+
+```yaml
+  - name: Anthropic News
+    type: html
+    category: ai
+    url: https://www.anthropic.com/news
+    item_selector: "a[href^='/news/']"   # CSS selektor odkazů na články
+    enabled: true
+    priority: 10
+```
+
+Funguje jen pro server-rendered stránky (bez JavaScriptu). Když zdroj 3×
+po sobě nic nevrátí, brief tě upozorní v sekci „Zdroje s problémy".
+
 ### Přidání arXiv query
 
 ```yaml
@@ -207,8 +248,9 @@ musí vejít do kontextu serveru.
 **LLM timeout** — 30B model generuje pomalu (jednotky tokenů/s). Zvyš
 `llm.timeout_seconds`; plná syntéza může trvat 15–30 minut.
 
-## Co v1 záměrně nedělá
+## Co záměrně neděláme
 
 Portfolio management, investiční doporučení, e-maily, GUI, embeddingy/RAG,
 multi-agent frameworky, placené API. Další přirozený krok:
-embedding-based dedup clustering a druhá (LLM) vrstva rankingu.
+embedding-based dedup clustering (rozhraní `Deduplicator.check()` je na to
+připravené) a automatické ladění vah keywords z nasbíraného feedbacku.

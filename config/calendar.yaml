@@ -1,0 +1,24 @@
+# Manually maintained economic / AI event calendar.
+#
+# Events within the configured horizon (settings: briefing.calendar_horizon_days)
+# are injected into the Watchlist section of the brief. Dates are YYYY-MM-DD.
+# Past events are ignored, so this file can grow — prune it occasionally.
+#
+# Sources for dates:
+#   FOMC:      https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+#   CPI (BLS): https://www.bls.gov/schedule/news_release/cpi.htm
+#   ECB:       https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html
+#
+# TODO: fill in real upcoming dates for your horizon; the examples below are
+# placeholders showing the format and MUST be replaced with verified dates.
+
+events:
+  - date: 2026-09-16
+    title: "FOMC meeting (day 1 of 2)"
+    category: markets
+    note: "Rate decision follows on day 2; check federalreserve.gov for the statement."
+
+  - date: 2026-09-17
+    title: "FOMC rate decision + press conference"
+    category: markets
+    note: "Verify date on the Fed's official FOMC calendar."

@@ -42,29 +42,32 @@ sources:
     priority: 8
 
   - name: Anthropic News
-    type: rss
+    type: html
     category: ai
-    url: ""
-    enabled: false
+    url: https://www.anthropic.com/news
+    item_selector: "a[href^='/news/']"
+    enabled: true
     priority: 10
-    # TODO: Anthropic does not publish an official RSS feed (as of writing).
-    # Check https://www.anthropic.com/news periodically or add a feed if one appears.
+    # No official RSS feed — scraped from the server-rendered listing page.
 
   - name: Meta AI Blog
-    type: rss
+    type: html
     category: ai
-    url: ""
-    enabled: false
+    url: https://ai.meta.com/blog/
+    item_selector: "a[href*='ai.meta.com/blog/']"
+    enabled: true
     priority: 8
-    # TODO: verify whether https://ai.meta.com/blog/ exposes a working RSS feed.
+    # No official RSS feed — scraped from the server-rendered listing page.
 
   - name: DeepMind Blog
-    type: rss
+    type: html
     category: ai
-    url: ""
+    url: https://deepmind.google/blog/
+    item_selector: "a[href*='/blog/']"
     enabled: false
     priority: 9
-    # TODO: verify current DeepMind blog feed URL (deepmind.google/blog).
+    # TODO: deepmind.google/blog is JS-rendered — the plain-HTML collector
+    # gets no links. Needs a feed URL or a different approach.
 
   # ------------------------------------------------------------------ AI: media
   - name: The Verge AI

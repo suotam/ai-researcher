@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -i 's/assert dedup.check\\(title=\"Different title entirely, no overlap\",\\\\n/X/' tests/test_dedup.py)",
+      "Bash(python -c \"print\\('noop'\\)\")"
+    ]
+  }
+}
