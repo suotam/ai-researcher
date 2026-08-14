@@ -1,0 +1,159 @@
+# Topic priorities used by the relevance scorer.
+#
+# Keyword matching is case-insensitive substring matching against
+# title + summary. "high" keywords score more than "medium" ones,
+# "entities" capture companies/organisations we track, "negative"
+# keywords penalise noise (clickbait, listicles, promos).
+#
+# importance: per-category multiplier applied to the final score (1.0 = neutral).
+
+ai:
+  importance: 1.0
+  entities:
+    - OpenAI
+    - Anthropic
+    - Claude
+    - Google
+    - DeepMind
+    - Gemini
+    - Meta
+    - Llama
+    - xAI
+    - Grok
+    - Microsoft
+    - NVIDIA
+    - AMD
+    - Amazon
+    - AWS
+    - Mistral
+    - Hugging Face
+  keywords:
+    high:
+      - frontier model
+      - open-weight
+      - open weights
+      - open-source model
+      - model release
+      - new model
+      - reasoning model
+      - multimodal
+      - llama.cpp
+      - ollama
+      - quantization
+      - speculative decoding
+      - inference
+      - agentic
+      - ai agent
+      - benchmark
+      - acquisition
+      - acquires
+      - funding round
+      - raises
+      - datacenter
+      - data center
+      - gpu
+      - npu
+      - capex
+      - state of the art
+    medium:
+      - local ai
+      - fine-tuning
+      - context window
+      - kv cache
+      - training run
+      - compute
+      - chip
+      - accelerator
+      - energy
+      - power
+      - startup
+      - investment
+      - partnership
+      - research
+      - paper
+  negative:
+    - webinar
+    - sponsored
+    - how to use
+    - top 10
+    - top 5
+    - best apps
+    - deal of the day
+    - coupon
+    - review roundup
+
+markets:
+  importance: 1.0
+  entities:
+    - Fed
+    - Federal Reserve
+    - ECB
+    - Powell
+    - Lagarde
+    - Treasury
+    - S&P 500
+    - Nasdaq
+    - Dow
+    - Nikkei
+    - DAX
+    - Apple
+    - Microsoft
+    - Nvidia
+    - Amazon
+    - Alphabet
+    - Meta
+    - Tesla
+    - Bitcoin
+    - Ethereum
+  keywords:
+    high:
+      - interest rate
+      - rate cut
+      - rate hike
+      - fomc
+      - inflation
+      - cpi
+      - pce
+      - payrolls
+      - unemployment
+      - yield
+      - yield curve
+      - bond
+      - earnings
+      - guidance
+      - recession
+      - vix
+      - volatility
+      - selloff
+      - rally
+      - default
+      - downgrade
+      - stimulus
+      - tariff
+    medium:
+      - gold
+      - oil
+      - crude
+      - commodities
+      - dollar
+      - fx
+      - currency
+      - crypto
+      - sentiment
+      - positioning
+      - futures
+      - ipo
+      - buyback
+      - dividend
+      - macro
+      - gdp
+      - housing
+  negative:
+    - sponsored
+    - how to invest
+    - stocks to buy
+    - top 10
+    - motley
+    - "5 things"
+    - opinion
+    - horoscope

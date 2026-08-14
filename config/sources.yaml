@@ -1,0 +1,192 @@
+# Source definitions for the AI Researcher.
+#
+# Each source:
+#   name:     unique human-readable name
+#   type:     rss | github | arxiv
+#   category: ai | markets
+#   url:      feed URL / "owner/repo" for github / full arXiv API query URL for arxiv
+#   enabled:  true/false
+#   priority: 0-10 (10 = most trusted / most important source)
+#
+# Prefer primary sources. If unsure whether a feed URL is real, keep it
+# disabled with a TODO note instead of guessing.
+
+sources:
+  # ------------------------------------------------------------------ AI: primary
+  - name: OpenAI News
+    type: rss
+    category: ai
+    url: https://openai.com/news/rss.xml
+    enabled: true
+    priority: 10
+
+  - name: Google AI Blog
+    type: rss
+    category: ai
+    url: https://blog.google/technology/ai/rss/
+    enabled: true
+    priority: 9
+
+  - name: NVIDIA Blog
+    type: rss
+    category: ai
+    url: https://blogs.nvidia.com/feed/
+    enabled: true
+    priority: 8
+
+  - name: Hugging Face Blog
+    type: rss
+    category: ai
+    url: https://huggingface.co/blog/feed.xml
+    enabled: true
+    priority: 8
+
+  - name: Anthropic News
+    type: rss
+    category: ai
+    url: ""
+    enabled: false
+    priority: 10
+    # TODO: Anthropic does not publish an official RSS feed (as of writing).
+    # Check https://www.anthropic.com/news periodically or add a feed if one appears.
+
+  - name: Meta AI Blog
+    type: rss
+    category: ai
+    url: ""
+    enabled: false
+    priority: 8
+    # TODO: verify whether https://ai.meta.com/blog/ exposes a working RSS feed.
+
+  - name: DeepMind Blog
+    type: rss
+    category: ai
+    url: ""
+    enabled: false
+    priority: 9
+    # TODO: verify current DeepMind blog feed URL (deepmind.google/blog).
+
+  # ------------------------------------------------------------------ AI: media
+  - name: The Verge AI
+    type: rss
+    category: ai
+    url: https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
+    enabled: true
+    priority: 6
+
+  - name: TechCrunch AI
+    type: rss
+    category: ai
+    url: https://techcrunch.com/category/artificial-intelligence/feed/
+    enabled: true
+    priority: 5
+
+  - name: VentureBeat AI
+    type: rss
+    category: ai
+    url: https://venturebeat.com/category/ai/feed/
+    enabled: true
+    priority: 4
+
+  - name: Simon Willison
+    type: rss
+    category: ai
+    url: https://simonwillison.net/atom/everything/
+    enabled: true
+    priority: 7
+    # High-signal independent coverage of local AI / LLM tooling.
+
+  # ------------------------------------------------------------------ AI: GitHub releases
+  - name: llama.cpp releases
+    type: github
+    category: ai
+    url: ggml-org/llama.cpp
+    enabled: true
+    priority: 7
+
+  - name: Ollama releases
+    type: github
+    category: ai
+    url: ollama/ollama
+    enabled: true
+    priority: 6
+
+  - name: vLLM releases
+    type: github
+    category: ai
+    url: vllm-project/vllm
+    enabled: false
+    priority: 5
+    # Enable if you want inference-server release tracking beyond llama.cpp/Ollama.
+
+  # ------------------------------------------------------------------ AI: papers
+  - name: arXiv AI/LLM
+    type: arxiv
+    category: ai
+    url: "http://export.arxiv.org/api/query?search_query=cat:cs.CL+OR+cat:cs.LG+OR+cat:cs.AI&sortBy=submittedDate&sortOrder=descending&max_results=15"
+    enabled: true
+    priority: 2
+    # Papers get a low default priority on purpose; only truly significant ones
+    # should ever reach the brief.
+
+  # ------------------------------------------------------------------ Markets: primary
+  - name: Federal Reserve Press
+    type: rss
+    category: markets
+    url: https://www.federalreserve.gov/feeds/press_all.xml
+    enabled: true
+    priority: 10
+
+  - name: ECB Press
+    type: rss
+    category: markets
+    url: https://www.ecb.europa.eu/rss/press.html
+    enabled: true
+    priority: 9
+
+  # ------------------------------------------------------------------ Markets: media
+  - name: CNBC Markets
+    type: rss
+    category: markets
+    url: https://www.cnbc.com/id/10000664/device/rss/rss.html
+    enabled: true
+    priority: 6
+
+  - name: CNBC Top News
+    type: rss
+    category: markets
+    url: https://www.cnbc.com/id/100003114/device/rss/rss.html
+    enabled: true
+    priority: 5
+
+  - name: MarketWatch Top Stories
+    type: rss
+    category: markets
+    url: https://feeds.content.dowjones.io/public/rss/mw_topstories
+    enabled: true
+    priority: 6
+
+  - name: Calculated Risk
+    type: rss
+    category: markets
+    url: https://www.calculatedriskblog.com/feeds/posts/default
+    enabled: true
+    priority: 7
+    # High-signal macro/housing blog.
+
+  - name: FT Home
+    type: rss
+    category: markets
+    url: ""
+    enabled: false
+    priority: 7
+    # TODO: verify FT RSS availability (most FT content is paywalled anyway).
+
+  - name: SEC Filings
+    type: rss
+    category: markets
+    url: ""
+    enabled: false
+    priority: 8
+    # TODO: consider https://www.sec.gov/cgi-bin/browse-edgar full-text feeds;
+    # needs a proper filter strategy first, otherwise it is pure noise.

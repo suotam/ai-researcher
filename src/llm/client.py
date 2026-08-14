@@ -1,0 +1,103 @@
+"""Minimal client for the local llama.cpp OpenAI-compatible server.
+
+Local-first: intended for 127.0.0.1 only. No cloud SDK, plain httpx.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+
+import httpx
+
+log = logging.getLogger(__name__)
+
+
+class LLMError(Exception):
+    """Raised when the local LLM server cannot produce a completion."""
+
+
+class LLMClient:
+    def __init__(self, *, base_url: str = "http://127.0.0.1:8080",
+                 model: str = "Muse-Glimmer-30B", timeout_seconds: float = 600,
+                 max_retries: int = 2):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout_seconds
+        self.max_retries = max_retries
+
+    def is_alive(self) -> bool:
+        """Check whether the llama.cpp server is up (GET /health)."""
+        for path in ("/health", "/v1/models"):
+            try:
+                resp = httpx.get(f"{self.base_url}{path}", timeout=5)
+                if resp.status_code == 200:
+                    return True
+            except httpx.HTTPError:
+                continue
+        return False
+
+    def chat(self, messages: list[dict], *, temperature: float = 0.4,
+             max_tokens: int = 3000) -> str:
+        """POST /v1/chat/completions with retries. Raises LLMError on failure."""
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                log.info("LLM call attempt %d/%d (model=%s)",
+                         attempt, self.max_retries + 1, self.model)
+                resp = httpx.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                if resp.status_code >= 500:
+                    raise LLMError(f"server error HTTP {resp.status_code}: {resp.text[:300]}")
+                if resp.status_code != 200:
+                    # 4xx will not get better on retry — fail immediately.
+                    raise LLMError(
+                        f"request rejected HTTP {resp.status_code}: {resp.text[:300]}"
+                    ) from None
+                data = resp.json()
+                choice = data["choices"][0]
+                message = choice.get("message", {})
+                content = message.get("content")
+                finish = choice.get("finish_reason")
+                if not isinstance(content, str) or not content.strip():
+                    if message.get("reasoning_content") and finish == "length":
+                        raise LLMError(
+                            "model spent the whole max_tokens budget on reasoning "
+                            "and produced no answer — increase llm.max_tokens in "
+                            "config/settings.yaml"
+                        ) from None
+                    raise LLMError("empty completion returned")
+                if finish == "length":
+                    log.warning("Completion hit max_tokens — the brief may be truncated")
+                return content
+            except httpx.ConnectError as exc:
+                raise LLMError(
+                    f"cannot connect to LLM server at {self.base_url} — is llama-server "
+                    f"running? ({exc})"
+                ) from exc
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                log.warning(
+                    "LLM call attempt %d timed out after %.0fs — a 30B model can be "
+                    "slow; consider raising llm.timeout_seconds", attempt, self.timeout)
+            except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
+                last_error = exc
+                log.warning("LLM call attempt %d failed: %s", attempt, exc)
+            except LLMError as exc:
+                if "server error" not in str(exc):
+                    raise
+                last_error = exc
+                log.warning("LLM call attempt %d failed: %s", attempt, exc)
+            if attempt <= self.max_retries:
+                time.sleep(2 * attempt)
+        raise LLMError(f"LLM call failed after {self.max_retries + 1} attempts: {last_error}")

@@ -1,0 +1,33 @@
+# Global settings for the AI Researcher.
+
+llm:
+  base_url: http://127.0.0.1:8080   # local llama.cpp server only, never 0.0.0.0
+  model: Muse-Glimmer-30B           # llama.cpp ignores exact value, kept for clarity
+  timeout_seconds: 1800             # Glimmer 30B @ ~3 tok/s + reasoning tokens needs headroom
+  max_retries: 1
+  temperature: 0.4
+  max_tokens: 5000                  # reasoning models spend part of this budget on thinking;
+                                    # prompt + max_tokens must fit into the server's -c context
+
+collection:
+  http_timeout_seconds: 20
+  max_items_per_source: 40          # hard cap per feed per run
+  lookback_hours: 24                # default window for --hours
+
+dedup:
+  fuzzy_title_threshold: 88         # rapidfuzz token_sort_ratio, 0-100
+  fuzzy_window_days: 7              # compare titles against articles from last N days
+
+ranking:
+  top_items: 10                     # how many articles are sent to the LLM
+  min_score: 25                     # articles below this never reach the brief
+  max_per_category: 8               # avoid one category flooding the brief
+
+briefing:
+  output_dir: output
+  language: cs                      # language of the generated brief (cs / en)
+  learning_topic_cooldown_days: 14  # don't reuse a learning topic within N days
+
+logging:
+  level: INFO
+  file: logs/researcher.log
