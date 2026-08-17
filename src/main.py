@@ -2,8 +2,10 @@
 
 Pipeline:
     SOURCES -> COLLECT -> NORMALIZE -> DEDUPLICATE (+coverage) -> STORE (SQLite)
-            -> RANK -> LLM RERANK -> SELECT TOP -> FULLTEXT -> GLIMMER SYNTHESIS
-            -> MORNING BRIEF
+            -> RANK -> LLM RERANK (fast model) -> SELECT TOP -> FULLTEXT
+            -> STORY NOTES (fast model, per article)
+            -> ANALYSIS (quality model, one call over the notes)
+            -> MORNING BRIEF + CHAT PACK
 
 Run:
     python -m src.main             # full run (needs local llama.cpp server)
@@ -23,11 +25,12 @@ from . import db
 from .collectors import arxiv, github, html, rss
 from .config import DB_PATH, PROJECT_ROOT, Config, Source, load_config
 from .llm.client import LLMClient, LLMError
-from .llm.prompts import build_briefing_prompt, build_weekly_prompt
+from .llm.prompts import build_analysis_prompt, build_weekly_prompt
 from .models import RawItem
 from .processing.deduplicate import Deduplicator
 from .processing.fulltext import enrich_articles
 from .processing.normalize import canonicalize_url, clean_text, content_hash
+from .processing.notes import extract_notes
 from .processing.ranking import score_article, select_top
 from .processing.rerank import llm_rerank
 from .reporting import briefing
@@ -81,6 +84,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weekly", action="store_true",
                         help="generate a weekly digest from the last 7 days "
                              "(no collection, uses stored articles)")
+    parser.add_argument("--model", default=None, metavar="NAME",
+                        help="synthesis model for this run (a section of "
+                             "config/llama-models.ini); overrides llm.model")
     return parser.parse_args(argv)
 
 
@@ -205,13 +211,20 @@ def rank_articles(conn, cfg: Config, article_ids: list[int],
 
 
 def make_llm_client(cfg: Config) -> LLMClient:
+    """Client for the quality model (llm.model): the analysis stage."""
     return LLMClient(
         base_url=str(cfg.setting("llm", "base_url", default="http://127.0.0.1:8080")),
-        model=str(cfg.setting("llm", "model", default="Muse-Glimmer-30B")),
-        timeout_seconds=float(cfg.setting("llm", "timeout_seconds", default=1800)),
-        max_retries=int(cfg.setting("llm", "max_retries", default=1)),
+        model=str(cfg.setting("llm", "model", default="muse-glimmer-30b")),
+        timeout_seconds=float(cfg.setting("llm", "timeout_seconds", default=3600)),
+        max_retries=int(cfg.setting("llm", "max_retries", default=0)),
         reasoning_effort=cfg.setting("llm", "reasoning_effort", default="low") or None,
     )
+
+
+def fast_client(cfg: Config, client: LLMClient) -> LLMClient:
+    """Client for the cheap stages (rerank, story notes, fallback analysis):
+    llm.fast_model, or the quality model when none is configured."""
+    return client.with_model(cfg.setting("llm", "fast_model"))
 
 
 def upcoming_calendar_events(cfg: Config, today: date) -> list[dict]:
@@ -232,28 +245,31 @@ CHARS_PER_TOKEN = 3.5  # rough estimate for prompt budgeting
 
 # A reasoning model burns a large part of its completion budget on thinking
 # before it writes the brief. Below this floor it tends to produce nothing,
-# so shorter article texts are always the better trade.
-MIN_COMPLETION_TOKENS = 4000
+# so shorter notes are always the better trade.
+MIN_COMPLETION_TOKENS = 3000
+
+
+def _language(cfg: Config) -> str:
+    return str(cfg.setting("briefing", "language", default="en"))
 
 
 def _fit_prompt(cfg: Config, client: LLMClient, selected: list[dict], day: date,
                 recent_topics: list[str],
                 calendar_events: list[dict]) -> tuple[str, str, int]:
-    """Build the briefing prompt sized to the server's actual context window.
+    """Build the analysis prompt sized to the server's actual context window.
 
-    Starts with generous article texts and shrinks them until prompt +
-    a completion of at least MIN_COMPLETION_TOKENS fits into n_ctx (with
-    ~5% margin). Returns (system, user, max_tokens)."""
+    Starts with full story notes and trims them until prompt + a completion
+    of at least MIN_COMPLETION_TOKENS fits into n_ctx (with ~5% margin).
+    Returns (system, user, max_tokens)."""
     max_tokens = int(cfg.setting("llm", "max_tokens", default=5000))
     n_ctx = client.context_size()
-    language = str(cfg.setting("briefing", "language", default="cs"))
 
     budget = max_tokens
-    for max_text_chars in (1500, 900, 600, 400):
-        system, user = build_briefing_prompt(
+    for max_notes_chars in (1500, 1000, 700, 400):
+        system, user = build_analysis_prompt(
             selected, date_str=day.isoformat(),
-            recent_learning_topics=recent_topics, language=language,
-            calendar_events=calendar_events, max_text_chars=max_text_chars,
+            recent_learning_topics=recent_topics, language=_language(cfg),
+            calendar_events=calendar_events, max_notes_chars=max_notes_chars,
         )
         if n_ctx is None:
             return system, user, max_tokens
@@ -262,35 +278,50 @@ def _fit_prompt(cfg: Config, client: LLMClient, selected: list[dict], day: date,
         if budget >= min(max_tokens, MIN_COMPLETION_TOKENS):
             if budget < max_tokens:
                 log.info("Context %d is tight: capping completion to %d tokens "
-                         "(article texts at %d chars). Restart llama-server "
-                         "with a larger -c for fuller briefs.",
-                         n_ctx, budget, max_text_chars)
+                         "(notes at %d chars). Restart llama-server with a "
+                         "larger -c for fuller briefs.",
+                         n_ctx, budget, max_notes_chars)
             return system, user, min(max_tokens, budget)
-    log.warning("Prompt barely fits context %s even with short texts — "
+    log.warning("Prompt barely fits context %s even with short notes — "
                 "the model may not finish the brief", n_ctx)
     return system, user, max(budget, 1500)
 
 
-def synthesize(cfg: Config, client: LLMClient, selected: list[dict], day: date,
+def synthesize(cfg: Config, client: LLMClient, fast: LLMClient,
+               selected: list[dict], day: date,
                recent_topics: list[str], calendar_events: list[dict],
                unhealthy: list[dict]) -> tuple[str, str | None]:
-    """Run Glimmer synthesis. Returns (markdown_body, learning_topic)."""
-    system, user, max_tokens = _fit_prompt(
-        cfg, client, selected, day, recent_topics, calendar_events)
-    try:
-        output = client.chat(
-            [{"role": "system", "content": system},
-             {"role": "user", "content": user}],
-            temperature=float(cfg.setting("llm", "temperature", default=0.4)),
-            max_tokens=max_tokens,
-        )
-    except LLMError as exc:
-        log.error("LLM synthesis failed: %s — writing fallback brief.", exc)
-        return briefing.render_fallback_brief(
-            selected, day, "chyba LLM", calendar_events, unhealthy), None
+    """Stage 2: the analytical layer over the story notes.
 
-    topic = briefing.extract_learning_topic(output)
-    return briefing.render_brief(output, selected, day, unhealthy), topic
+    Tries the quality model first; if it fails (timeout, server error) the
+    fast model writes the analysis so a brief always arrives. Only when both
+    fail is the fallback (notes + raw selection) written.
+    Returns (markdown_body, learning_topic)."""
+    temperature = float(cfg.setting("llm", "temperature", default=0.4))
+    tried: list[LLMClient] = [client]
+    if fast.model != client.model:
+        tried.append(fast)
+    for stage_client in tried:
+        system, user, max_tokens = _fit_prompt(
+            cfg, stage_client, selected, day, recent_topics, calendar_events)
+        try:
+            output = stage_client.chat(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": user}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except LLMError as exc:
+            log.error("Analysis with %s failed: %s", stage_client.model, exc)
+            continue
+        topic = briefing.extract_learning_topic(output)
+        return briefing.render_brief(output, selected, day, unhealthy,
+                                     language=_language(cfg)), topic
+
+    log.error("All analysis models failed — writing fallback brief.")
+    return briefing.render_fallback_brief(
+        selected, day, "LLM error", calendar_events, unhealthy,
+        language=_language(cfg)), None
 
 
 # ------------------------------------------------------------------ weekly
@@ -311,18 +342,19 @@ def run_weekly(cfg: Config, args: argparse.Namespace) -> int:
     out_dir = PROJECT_ROOT / cfg.setting("briefing", "output_dir", default="output")
     path = briefing.weekly_path(out_dir, today)
 
+    language = _language(cfg)
     if args.no_llm or not rows:
         content = briefing.render_fallback_brief(
-            rows, today, "--no-llm" if args.no_llm else "žádné položky")
+            rows, today, "--no-llm" if args.no_llm else "no items", language=language)
     else:
         client = make_llm_client(cfg)
         if not client.is_alive():
             log.error("LLM server not reachable — writing fallback weekly digest.")
-            content = briefing.render_fallback_brief(rows, today, "server nedostupný")
+            content = briefing.render_fallback_brief(rows, today, "server unreachable",
+                                                     language=language)
         else:
             system, user = build_weekly_prompt(
-                rows, date_str=today.isoformat(),
-                language=str(cfg.setting("briefing", "language", default="cs")))
+                rows, date_str=today.isoformat(), language=language)
             try:
                 output = client.chat(
                     [{"role": "system", "content": system},
@@ -331,10 +363,11 @@ def run_weekly(cfg: Config, args: argparse.Namespace) -> int:
                     max_tokens=int(cfg.setting("llm", "max_tokens", default=5000)),
                 )
                 content = briefing.render_brief(output, rows, today,
-                                                title="Weekly Digest")
+                                                title="Weekly Digest", language=language)
             except LLMError as exc:
                 log.error("Weekly synthesis failed: %s", exc)
-                content = briefing.render_fallback_brief(rows, today, "chyba LLM")
+                content = briefing.render_fallback_brief(rows, today, "LLM error",
+                                                         language=language)
 
     briefing.write_brief(content, path)
     db.insert_briefing(
@@ -357,6 +390,8 @@ def run(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_config()
     setup_logging(cfg)
+    if args.model:
+        cfg.settings.setdefault("llm", {})["model"] = args.model
 
     if args.weekly:
         log.info("=== Weekly digest run started ===")
@@ -416,6 +451,7 @@ def run(argv: list[str] | None = None) -> int:
 
     # 5) LLM rerank (optional, falls back to cheap ranking)
     client = make_llm_client(cfg)
+    fast = fast_client(cfg, client)
     llm_available = not args.no_llm and client.is_alive()
     if not args.no_llm and not llm_available:
         log.error("LLM server at %s is not reachable — continuing without it. "
@@ -425,7 +461,7 @@ def run(argv: list[str] | None = None) -> int:
     selected: list[dict] | None = None
     if llm_available and cfg.setting("ranking", "llm_rerank", default=True) \
             and len(preselected) > top_n:
-        selected = llm_rerank(client, preselected, top_n=top_n)
+        selected = llm_rerank(fast, preselected, top_n=top_n)
     if selected is None:
         selected = select_top(
             preselected,
@@ -446,29 +482,48 @@ def run(argv: list[str] | None = None) -> int:
             max_chars=int(cfg.setting("collection", "fulltext_max_chars", default=4000)),
         )
 
-    # 7) synthesize + write brief
+    # 7) story notes (fast model) -> analysis (quality model) -> write brief
     day = date.today()
     out_dir = PROJECT_ROOT / cfg.setting("briefing", "output_dir", default="output")
     path = briefing.briefing_path(out_dir, day)
     calendar_events = upcoming_calendar_events(cfg, day)
     unhealthy = [dict(r) for r in db.unhealthy_sources(conn, threshold=HEALTH_THRESHOLD)]
+    language = _language(cfg)
 
     learning_topic: str | None = None
     if not llm_available:
-        reason = "--no-llm" if args.no_llm else "server nedostupný"
+        reason = "--no-llm" if args.no_llm else "server unreachable"
         content = briefing.render_fallback_brief(selected, day, reason,
-                                                 calendar_events, unhealthy)
+                                                 calendar_events, unhealthy,
+                                                 language=language)
     elif not selected:
         log.info("Nothing significant found in the window — writing empty brief.")
-        content = briefing.render_fallback_brief(selected, day, "žádné relevantní položky",
-                                                 calendar_events, unhealthy)
+        content = briefing.render_fallback_brief(selected, day, "no relevant items",
+                                                 calendar_events, unhealthy,
+                                                 language=language)
     else:
+        if cfg.setting("briefing", "story_notes", default=True):
+            extract_notes(
+                fast, selected,
+                max_text_chars=int(cfg.setting("collection", "fulltext_max_chars",
+                                               default=4000)),
+                max_tokens=int(cfg.setting("briefing", "notes_max_tokens", default=600)),
+                language=language,
+            )
+            # The facts layer is ready minutes before the analysis: publish
+            # it now so the file is useful even while the slow model works.
+            briefing.write_brief(briefing.render_fallback_brief(
+                selected, day, "analysis in progress", calendar_events, unhealthy,
+                language=language), path)
         recent_topics = db.recent_learning_topics(
             conn, int(cfg.setting("briefing", "learning_topic_cooldown_days", default=14)))
         content, learning_topic = synthesize(
-            cfg, client, selected, day, recent_topics, calendar_events, unhealthy)
+            cfg, client, fast, selected, day, recent_topics, calendar_events, unhealthy)
 
     briefing.write_brief(content, path)
+    if cfg.setting("briefing", "chat_pack", default=True):
+        briefing.write_brief(briefing.render_chat_pack(content, day),
+                             briefing.chat_pack_path(out_dir, day))
 
     # 8) record briefing + mark articles
     selected_ids = [a["id"] for a in selected]

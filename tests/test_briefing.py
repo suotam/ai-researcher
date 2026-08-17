@@ -59,4 +59,6 @@ def test_fallback_brief_contains_items_and_sources():
 
 def test_fallback_brief_empty_selection():
     result = render_fallback_brief([], date(2026, 8, 14), "test")
-    assert "Nic významného" in result
+    assert "Nothing significant" in result
+    result_cs = render_fallback_brief([], date(2026, 8, 14), "test", language="cs")
+    assert "Nic významného" in result_cs

@@ -171,3 +171,68 @@ def test_health_section_rendering():
     text = health_section([{"name": "S1", "last_result": "error", "consecutive_bad": 4}])
     assert "S1" in text and "4×" in text
     assert health_section([]) == ""
+
+
+# ------------------------------------------------------- per-stage LLM models
+
+def test_fast_client_uses_configured_model():
+    from src.main import fast_client, make_llm_client
+    cfg = Config(settings={"llm": {"model": "muse-glimmer-30b",
+                                   "fast_model": "gemma-4-26b-a4b"}},
+                 sources=[], topics={})
+    quality = make_llm_client(cfg)
+    fast = fast_client(cfg, quality)
+    assert quality.model == "muse-glimmer-30b"
+    assert fast.model == "gemma-4-26b-a4b"
+    assert fast.base_url == quality.base_url
+    assert fast.timeout == quality.timeout
+
+
+def test_fast_client_defaults_to_quality_model():
+    from src.main import fast_client, make_llm_client
+    cfg = Config(settings={"llm": {"model": "muse-glimmer-30b"}}, sources=[], topics={})
+    quality = make_llm_client(cfg)
+    assert fast_client(cfg, quality) is quality
+
+
+# ------------------------------------------------------ two-stage synthesis
+
+def test_notes_prompt_contains_article_text_and_limits():
+    from src.llm.prompts import build_notes_prompt
+    system, user = build_notes_prompt(
+        {"title": "T", "source_name": "S", "raw_text": "x" * 5000, "url": "https://e/1"},
+        max_text_chars=100)
+    assert "extract" in system.lower()
+    assert "x" * 100 in user and "x" * 101 not in user
+    assert "**Facts**" in user
+
+
+def test_analysis_prompt_prefers_notes_over_raw_text():
+    from src.llm.prompts import build_analysis_prompt
+    articles = [
+        {"ref_id": "ARTICLE_1", "title": "A", "source_name": "S", "category": "ai",
+         "notes": "**Facts**\n- note one", "raw_text": "RAW SHOULD NOT APPEAR"},
+        {"ref_id": "ARTICLE_2", "title": "B", "source_name": "S", "category": "markets",
+         "raw_text": "raw fallback text"},
+    ]
+    system, user = build_analysis_prompt(articles, date_str="2026-08-15",
+                                         recent_learning_topics=["x"], language="en")
+    assert "note one" in user and "RAW SHOULD NOT APPEAR" not in user
+    assert "raw fallback text" in user  # article without notes falls back to text
+    assert "[ARTICLE_1]" in user and "[ARTICLE_2]" in user
+    assert "Write in English" in user
+    assert "LEARNING_TOPIC:" in user
+
+
+def test_render_brief_appends_story_notes_and_chat_pack():
+    from src.reporting.briefing import render_brief, render_chat_pack
+    articles = [{"ref_id": "ARTICLE_7", "title": "Seven", "url": "https://e/7",
+                 "source_name": "S", "notes": "**Facts**\n- fact seven"}]
+    out = render_brief("## Executive Summary\n- thing [ARTICLE_7]", articles,
+                       date(2026, 8, 15), language="en")
+    assert "[[7]](https://e/7)" in out
+    assert "## Story Notes" in out and "fact seven" in out
+    assert out.index("## Executive Summary") < out.index("## Story Notes") < out.index("## Sources")
+    pack = render_chat_pack(out, date(2026, 8, 15))
+    assert pack.startswith("# Chat pack — 2026-08-15") and out in pack
+

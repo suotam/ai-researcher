@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(sed -i 's/assert dedup.check\\(title=\"Different title entirely, no overlap\",\\\\n/X/' tests/test_dedup.py)",
-      "Bash(python -c \"print\\('noop'\\)\")"
+      "Bash(python -c \"print\\('noop'\\)\")",
+      "Read(//c/Users/PC/AppData/Local/Temp/claude/c--Users-PC-Documents-ai-researcher/cb6c8d48-937b-40a6-a13b-f9b522190493/scratchpad/**)",
+      "Bash(date +%T)",
+      "Bash(curl -s -m 3000 -X POST http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' --data-binary @glimmer-test.json -o glimmer-test.out.json)",
+      "Bash(curl -s -m 590 -X POST http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' --data-binary @glimmer-test.json -o glimmer-test.out.json)",
+      "Bash(sed 's/Nevymýšlej čísla, drž se logiky./Nevymýšlej čísla, drž se logiky. Přidej ke každé odrážce jednu větu kontextu./' gemma-test.json)",
+      "Bash(curl -s -m 590 -X POST http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' --data-binary @gemma-test2.json -o gemma-test2.out.json)",
+      "Bash(/c/Users/PC/Documents/ai-researcher/.venv/Scripts/python.exe -c ' *)"
     ]
   }
 }

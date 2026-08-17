@@ -1,30 +1,30 @@
-"""Prompts for the Glimmer 30B synthesis step."""
+"""Prompts for the two-stage synthesis.
+
+Stage 1 (fast model, one call per article): structured *story notes* — the
+facts, numbers and quotes of each selected article, extracted from its full
+text.
+
+Stage 2 (quality model, one call): the *analytical layer* of the brief,
+written from those notes — priorities, connections, what to watch, one deep
+dive, one concept to learn. The model does not retell the facts; the notes
+are printed below its analysis in the final brief.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
-SYSTEM_PROMPT_CS = """Jsi senior research analyst, ne sumarizátor zpráv.
+LANGUAGE_NAMES = {"cs": "Czech", "en": "English"}
 
-Pravidla:
-- Analyzuj POUZE dodané zdroje. Nikdy si nevymýšlej fakta, čísla ani události.
-- Jasně rozlišuj fakta (co zdroje říkají) od inference (tvoje interpretace).
-- Pokud si zdroje protiřečí, výslovně na to upozorni.
-- Prioritizuj význam před množstvím. Méně důležité položky vynech.
-- S kauzalitou zacházej opatrně: nevydávej korelaci automaticky za příčinu.
-  Pokud driver pohybu trhu není ve zdrojích doložený, napiš to.
-- U finančních trhů NIKDY nedávej osobní investiční doporučení.
-- Každé tvrzení opři o zdroj: odkazuj na položky jejich ID ve tvaru [ARTICLE_12].
-- Nevymýšlej budoucí události bez zdroje.
-- Pokud se v některé oblasti nestalo nic významného, napiš to. "Nic důležitého"
-  je validní výsledek — negeneruj obsah jen proto, aby report vypadal plný.
 
-Piš česky, věcně, bez clickbaitu."""
+def _lang_line(language: str) -> str:
+    return f"Write in {LANGUAGE_NAMES.get(language, 'English')}."
 
-SYSTEM_PROMPT_EN = """You are a senior research analyst, not a news summarizer.
+
+SYSTEM_PROMPT = """You are a senior research analyst, not a news summarizer.
 
 Rules:
-- Analyze ONLY the provided sources. Never invent facts, numbers or events.
+- Analyze ONLY the provided material. Never invent facts, numbers or events.
 - Clearly separate facts (what sources say) from inference (your interpretation).
 - If sources conflict, explicitly flag it.
 - Prioritize significance over volume. Drop unimportant items.
@@ -38,130 +38,154 @@ Rules:
 
 Write factually, no clickbait."""
 
+NOTES_SYSTEM = """You are a research assistant preparing story notes for a
+senior analyst. You extract, you do not editorialize. Use ONLY the article
+text; if a detail is not in the text, leave it out. Keep exact numbers,
+names, dates and tickers. Answer in Markdown, no preamble."""
 
-def _article_block(ref_id: str, article: dict[str, Any], max_text_chars: int = 600) -> str:
+
+def _article_header(a: dict[str, Any]) -> str:
+    coverage = a.get("duplicate_count") or 0
+    cov = f", covered by {coverage + 1} outlets" if coverage else ""
+    return (f"{a.get('title', '')} — {a.get('source_name', '')}, "
+            f"{a.get('published_at') or 'unknown date'} "
+            f"(category: {a.get('category', '')}{cov})")
+
+
+def build_notes_prompt(article: dict[str, Any], *, max_text_chars: int = 4000,
+                       language: str = "en") -> tuple[str, str]:
+    """Stage 1: notes for ONE article. Returns (system, user)."""
     text = (article.get("raw_text") or article.get("summary") or "")[:max_text_chars]
-    return (
-        f"[{ref_id}]\n"
-        f"Title: {article.get('title', '')}\n"
-        f"Source: {article.get('source_name', '')} (category: {article.get('category', '')})\n"
-        f"URL: {article.get('url', '')}\n"
-        f"Published: {article.get('published_at') or 'unknown'}\n"
-        f"Text: {text}\n"
-    )
+    user = f"""Article: {_article_header(article)}
+URL: {article.get('url', '')}
+
+TEXT:
+{text}
+
+Write story notes in exactly this format ({_lang_line(language)}):
+
+**Facts**
+- 3-7 bullets: what happened, who, when, how much. Keep numbers and names exact.
+**Quotes**
+- 0-2 short verbatim quotes with speaker, only if they carry information. Omit the section if none.
+**Why it might matter**
+One or two sentences. Mark inference as inference.
+**Open questions**
+- 0-2 bullets: what the article does not answer. Omit if none.
+
+Maximum 180 words. No title, no preamble."""
+    return NOTES_SYSTEM, user
 
 
-def _coverage_line(article: dict[str, Any]) -> str:
-    count = article.get("duplicate_count") or 0
-    if not count:
-        return ""
-    outlets = article.get("coverage_sources") or []
-    detail = f" ({', '.join(outlets[:5])})" if outlets else ""
-    return f"Coverage: reported by {count + 1} outlets{detail}\n"
+def _notes_block(a: dict[str, Any], max_chars: int) -> str:
+    body = (a.get("notes") or "").strip()
+    if not body:
+        # Notes stage unavailable: fall back to raw text (trimmed harder).
+        body = "TEXT: " + (a.get("raw_text") or a.get("summary") or "")[:max_chars]
+    return f"[{a['ref_id']}] {_article_header(a)}\n{body[:max_chars]}\n"
 
 
 def _calendar_block(events: list[dict[str, Any]]) -> str:
     if not events:
         return ""
-    lines = ["", "=== KALENDÁŘ (ručně udržovaný, ověřené nadcházející události) ===", ""]
+    lines = ["", "=== CALENDAR (manually maintained, verified upcoming events) ===", ""]
     for e in events:
         note = f" — {e['note']}" if e.get("note") else ""
         lines.append(f"- {e['date']}: {e['title']} [{e.get('category', '')}]{note}")
     lines.append("")
-    lines.append("Tyto události zařaď do sekce Watchlist (jsou ověřené, "
-                 "smíš je použít bez [ARTICLE_x] reference).")
+    lines.append("Put these into the Watchlist (they are verified, no "
+                 "[ARTICLE_x] reference needed).")
     return "\n".join(lines)
 
 
-def build_briefing_prompt(articles: list[dict[str, Any]], *, date_str: str,
+def build_analysis_prompt(articles: list[dict[str, Any]], *, date_str: str,
                           recent_learning_topics: list[str],
-                          language: str = "cs",
+                          language: str = "en",
                           calendar_events: list[dict[str, Any]] | None = None,
-                          max_text_chars: int = 600) -> tuple[str, str]:
-    """Return (system_prompt, user_prompt). Each article dict must contain a
-    'ref_id' key like 'ARTICLE_12' (its DB id)."""
-    system = SYSTEM_PROMPT_CS if language == "cs" else SYSTEM_PROMPT_EN
+                          max_notes_chars: int = 1500) -> tuple[str, str]:
+    """Stage 2: the analytical layer, from story notes. Returns (system, user).
+    Each article dict must contain 'ref_id' like 'ARTICLE_12' and ideally
+    'notes' (stage 1 output)."""
+    blocks = "\n".join(_notes_block(a, max_notes_chars) for a in articles)
+    avoid = ", ".join(recent_learning_topics) if recent_learning_topics else "(none yet)"
 
-    blocks = "\n".join(
-        _article_block(a["ref_id"], a, max_text_chars) + _coverage_line(a)
-        for a in articles
-    )
-    avoid = ", ".join(recent_learning_topics) if recent_learning_topics else "(zatím žádná)"
+    user = f"""Date: {date_str}
 
-    user = f"""Datum: {date_str}
+Below are analyst story notes on today's selected items (AI + financial
+markets). The facts are already extracted; your job is the ANALYTICAL LAYER
+of the morning brief: judge what matters, connect stories, say what to
+watch. Do not retell the facts — the notes are printed under your analysis
+in the final report. Every claim must cite its item as [ARTICLE_x].
 
-Níže jsou vybrané položky z posledního sběru (AI + finanční trhy). Vytvoř z nich
-ranní briefing v Markdownu přesně v této struktuře (nadpisy zachovej):
+Write Markdown in exactly this structure (keep the headings):
 
 ## Executive Summary
-Maximálně 5 nejdůležitějších věcí napříč AI + Markets, každá 1-3 věty.
+Up to 5 bullets across AI + Markets, most important first, 1-3 sentences
+each: what happened and why it matters. Include the [ARTICLE_x] refs.
 
-## AI
-Pro každou důležitou událost podsekce:
-### <Název události>
-**Co se stalo** ...
-**Proč je to důležité** ...
-**Co sledovat dál** ...
-**Zdroje** [ARTICLE_x], [ARTICLE_y]
-
-## Markets
-Stejný formát jako AI. Nejen ceny — vysvětluj kontext a možné drivery.
-Pokud driver není ve zdrojích spolehlivě doložený, výslovně to uveď.
+## What Matters Today
+3-5 themes. A theme may combine several items if they are genuinely
+connected; say explicitly when a connection is inference. Format:
+### <Theme title>
+**Why it matters** ...
+**What to watch** ...
+**Sources** [ARTICLE_x], [ARTICLE_y]
+Cover markets as well as AI: context and possible drivers, and state it
+when a driver is not supported by the sources.
 
 ## Deep Dive
-Maximálně JEDNA událost, která si zaslouží hlubší analýzu. Pokud si ji dnes
-žádná nezaslouží, napiš jen "Dnes bez deep dive." a nic nevymýšlej.
+At most ONE item that deserves deeper analysis: second-order effects, who
+wins/loses, what would change your view. If nothing qualifies today, write
+just "No deep dive today." and nothing else.
 
-## Dnes se nauč
-Vyber JEDEN koncept související s dnešními událostmi a vysvětli ho
-(cca 5 minut čtení). Nedávno použitá témata, kterým se vyhni: {avoid}.
-Na první řádek sekce napiš přesně: LEARNING_TOPIC: <název tématu>
+## Learn Today
+Pick ONE concept related to today's items and explain it in ~5 minutes of
+reading. Recently used topics to avoid: {avoid}.
+The first line of this section must be exactly: LEARNING_TOPIC: <topic name>
 
 ## Watchlist
-Několik věcí ke sledování v dalších hodinách/dnech — POUZE odvozené
-z dodaných zdrojů nebo z kalendáře níže, žádné vymyšlené budoucí eventy.
+Things to watch in the coming hours/days — ONLY derived from the notes or
+from the calendar below, no invented events.
 
-Důležité: každé tvrzení odkazuj na zdrojové položky pomocí [ARTICLE_x].
-Pokud v některé kategorii není nic významného, napiš to.
-U položek s "Coverage" údajem: široké pokrytí více médii signalizuje
-významnost události.
+Total length 450-650 words — be dense, not long. Wide coverage by several outlets ("covered by
+N outlets") signals significance. If a category has nothing significant,
+say so. {_lang_line(language)}
 
-=== POLOŽKY ===
+=== STORY NOTES ===
 
 {blocks}{_calendar_block(calendar_events or [])}"""
-    return system, user
+    return SYSTEM_PROMPT, user
 
 
 def build_weekly_prompt(articles: list[dict[str, Any]], *, date_str: str,
-                        language: str = "cs",
+                        language: str = "en",
                         max_text_chars: int = 400) -> tuple[str, str]:
     """Weekly digest: trends and through-lines rather than day-by-day news."""
-    system = SYSTEM_PROMPT_CS if language == "cs" else SYSTEM_PROMPT_EN
-    blocks = "\n".join(
-        _article_block(a["ref_id"], a, max_text_chars) + _coverage_line(a)
-        for a in articles
-    )
-    user = f"""Datum: {date_str}
+    blocks = []
+    for a in articles:
+        text = (a.get("raw_text") or a.get("summary") or "")[:max_text_chars]
+        blocks.append(f"[{a['ref_id']}] {_article_header(a)}\nURL: {a.get('url', '')}\n"
+                      f"Text: {text}\n")
+    user = f"""Date: {date_str}
 
-Níže jsou nejvýznamnější položky z POSLEDNÍCH 7 DNÍ (AI + finanční trhy).
-Vytvoř týdenní přehled v Markdownu — ne výčet zpráv den po dni, ale analýzu
-trendů a souvislostí napříč týdnem:
+Below are the most significant items of the LAST 7 DAYS (AI + financial
+markets). Write a weekly digest in Markdown — not a day-by-day list, but an
+analysis of trends and connections across the week:
 
-## Týden v kostce
-3-5 vět: co byl hlavní příběh týdne.
+## The Week in Brief
+3-5 sentences: the main story of the week.
 
-## Trendy a souvislosti
-2-4 podsekce. Každá spojuje více událostí týdne do jednoho vývoje/tématu
-(např. "capex hyperscalerů dál roste", "trh přeceňuje sazby"). U každé:
-**Co se dělo** ... **Kam to směřuje** ... **Zdroje** [ARTICLE_x], [ARTICLE_y]
+## Trends and Connections
+2-4 subsections. Each ties several items of the week into one development
+(e.g. "hyperscaler capex keeps climbing", "the market reprices rates").
+For each: **What happened** ... **Where it is heading** ... **Sources** [ARTICLE_x], [ARTICLE_y]
 
-## Co příští týden
-Jen věci doložené ve zdrojích.
+## Next Week
+Only things supported by the sources.
 
-Každé tvrzení odkazuj pomocí [ARTICLE_x]. Pokud byl týden chudý na události,
-řekni to.
+Cite every claim as [ARTICLE_x]. If the week was thin, say so. {_lang_line(language)}
 
-=== POLOŽKY ===
+=== ITEMS ===
 
-{blocks}"""
-    return system, user
+{chr(10).join(blocks)}"""
+    return SYSTEM_PROMPT, user

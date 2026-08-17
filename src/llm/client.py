@@ -1,6 +1,12 @@
 """Minimal client for the local llama.cpp OpenAI-compatible server.
 
 Local-first: intended for 127.0.0.1 only. No cloud SDK, plain httpx.
+
+The server is expected to run in *router mode* (``llama-server
+--models-preset config/llama-models.ini``): the ``model`` field of each
+request names a preset section and the router loads that model on demand,
+swapping out the previous one when ``--models-max`` is reached. A classic
+single-model server works too — it simply ignores the ``model`` field.
 """
 
 from __future__ import annotations
@@ -19,13 +25,21 @@ class LLMError(Exception):
 
 class LLMClient:
     def __init__(self, *, base_url: str = "http://127.0.0.1:8080",
-                 model: str = "Muse-Glimmer-30B", timeout_seconds: float = 600,
+                 model: str = "muse-glimmer-30b", timeout_seconds: float = 600,
                  max_retries: int = 2, reasoning_effort: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout_seconds
         self.max_retries = max_retries
         self.reasoning_effort = reasoning_effort
+
+    def with_model(self, model: str | None) -> "LLMClient":
+        """Same server and limits, different model (per pipeline stage)."""
+        if not model or model == self.model:
+            return self
+        return LLMClient(base_url=self.base_url, model=model,
+                         timeout_seconds=self.timeout, max_retries=self.max_retries,
+                         reasoning_effort=self.reasoning_effort)
 
     def is_alive(self) -> bool:
         """Check whether the llama.cpp server is up (GET /health)."""
@@ -39,9 +53,14 @@ class LLMClient:
         return False
 
     def context_size(self) -> int | None:
-        """Ask llama.cpp for its context window (GET /props). None if unknown."""
+        """Ask llama.cpp for the model's context window (GET /props).
+
+        In router mode /props needs ``?model=`` and loading the model on
+        first touch can take a minute, hence the generous timeout. None if
+        unknown."""
         try:
-            resp = httpx.get(f"{self.base_url}/props", timeout=5)
+            resp = httpx.get(f"{self.base_url}/props",
+                             params={"model": self.model}, timeout=300)
             if resp.status_code == 200:
                 data = resp.json()
                 n_ctx = (data.get("default_generation_settings") or {}).get("n_ctx") \

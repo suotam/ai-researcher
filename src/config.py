@@ -23,9 +23,12 @@ DB_PATH = DATA_DIR / "researcher.db"
 DEFAULT_SETTINGS: dict[str, Any] = {
     "llm": {
         "base_url": "http://127.0.0.1:8080",
-        "model": "Muse-Glimmer-30B",
-        "timeout_seconds": 1800,
-        "max_retries": 1,
+        # Names of sections in config/llama-models.ini (router mode).
+        "model": "muse-glimmer-30b",      # quality model: analysis, weekly digest
+        "fast_model": None,               # rerank, story notes, fallback analysis;
+                                          # None -> same as `model`
+        "timeout_seconds": 3600,
+        "max_retries": 0,
         "temperature": 0.4,
         "max_tokens": 6144,
         "reasoning_effort": "low",
@@ -50,7 +53,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "briefing": {
         "output_dir": "output",
-        "language": "cs",
+        "language": "en",
+        "story_notes": True,              # stage 1: per-article notes by fast_model
+        "notes_max_tokens": 600,
+        "chat_pack": True,                # also write YYYY-MM-DD-chat-pack.md
         "learning_topic_cooldown_days": 14,
         "calendar_horizon_days": 7,
         "weekly_top_items": 15,

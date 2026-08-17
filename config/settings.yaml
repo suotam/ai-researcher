@@ -2,14 +2,24 @@
 
 llm:
   base_url: http://127.0.0.1:8080   # local llama.cpp server only, never 0.0.0.0
-  model: Muse-Glimmer-30B           # llama.cpp ignores exact value, kept for clarity
-  timeout_seconds: 1800             # Glimmer 30B @ ~3 tok/s + reasoning tokens needs headroom
-  max_retries: 1
+  # Model names = section names in config/llama-models.ini (llama-server runs
+  # in router mode and loads the requested model on demand, one at a time).
+  #   muse-glimmer-30b  ~4 tok/s on the RTX 5060 (only part fits in VRAM) — best judgment
+  #   gemma-4-26b-a4b   ~35 tok/s (MoE, experts mostly in RAM)              — fast
+  # Two-stage synthesis: fast_model extracts per-article "story notes"
+  # (facts, numbers, quotes) and reranks; model writes the analytical layer
+  # over those notes. If model fails, fast_model writes the analysis too.
+  model: muse-glimmer-30b           # analysis (Executive Summary, themes, deep dive), weekly digest
+  fast_model: gemma-4-26b-a4b       # rerank + story notes + fallback; omit -> same as model
+  timeout_seconds: 3600             # Glimmer @ ~4 tok/s with reasoning needs headroom;
+                                    # a fast model simply finishes early
+  max_retries: 0                    # a retry after a timeout only doubles the wait
   temperature: 0.4
-  max_tokens: 6144                  # reasoning models spend part of this budget on thinking;
-                                    # prompt + max_tokens must fit into the server's -c context
-  reasoning_effort: low             # forwarded to llama.cpp; lowers thinking-token burn
-                                    # on templates that support it, ignored otherwise
+  max_tokens: 4096                  # analysis is 500-800 words + reasoning; prompt +
+                                    # max_tokens must fit into the server's -c context
+  reasoning_effort: low             # forwarded to llama.cpp; used by templates that support it.
+                                    # Glimmer's template wants reasoning_strength instead —
+                                    # that is set per model in config/llama-models.ini
 
 collection:
   http_timeout_seconds: 20
@@ -31,7 +41,11 @@ ranking:
 
 briefing:
   output_dir: output
-  language: cs                      # language of the generated brief (cs / en)
+  language: en                      # language of the generated brief (en / cs)
+  story_notes: true                 # stage 1: per-article notes by fast_model (facts layer)
+  notes_max_tokens: 600
+  chat_pack: true                   # also write YYYY-MM-DD-chat-pack.md — the brief with a
+                                    # preamble, ready to paste into ChatGPT/Claude to discuss
   learning_topic_cooldown_days: 14  # don't reuse a learning topic within N days
   calendar_horizon_days: 7          # config/calendar.yaml events within N days go to Watchlist
   weekly_top_items: 15              # articles fed into the --weekly digest
